@@ -10,8 +10,9 @@ use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
 use Laravel\Sanctum\HasApiTokens;
+use Tymon\JWTAuth\Contracts\JWTSubject;
 
-class Customer extends Authenticatable
+class Customer extends Authenticatable implements JWTSubject
 {
     use HasApiTokens, HasFactory, Notifiable, SoftDeletes;
 
@@ -237,8 +238,8 @@ class Customer extends Authenticatable
         // Basic phone formatting - can be enhanced based on country
         $phone = $this->phone;
         if (strlen($phone) === 11 && str_starts_with($phone, '01')) {
-            // Bangladesh mobile format
-            return '+880 ' . substr($phone, 0, 5) . '-' . substr($phone, 5);
+            // Bangladesh mobile format - remove leading 0 and format
+            return '+880 ' . substr($phone, 1, 4) . '-' . substr($phone, 5);
         }
         return $phone;
     }
@@ -246,6 +247,39 @@ class Customer extends Authenticatable
     public function getCommunicationPreferencesAttribute()
     {
         return $this->preferences['communication'] ?? [];
+    }
+
+    /**
+     * Find or create a customer by phone number (for guest checkout)
+     * Creates customer with default password if phone doesn't exist
+     */
+    public static function findOrCreateByPhone(string $phone, array $additionalData = []): self
+    {
+        // Clean phone number (remove spaces, dashes, etc.)
+        $cleanPhone = preg_replace('/[^0-9+]/', '', $phone);
+        
+        // Try to find existing customer by phone
+        $customer = static::where('phone', $cleanPhone)->first();
+        
+        if ($customer) {
+            return $customer;
+        }
+        
+        // Create new guest customer
+        return static::create([
+            'customer_type' => 'ecommerce',
+            'phone' => $cleanPhone,
+            'name' => $additionalData['name'] ?? 'Customer ' . $cleanPhone,
+            'email' => $additionalData['email'] ?? null,
+            'password' => bcrypt('default'), // Default password
+            'address' => $additionalData['address'] ?? null,
+            'city' => $additionalData['city'] ?? null,
+            'state' => $additionalData['state'] ?? null,
+            'postal_code' => $additionalData['postal_code'] ?? null,
+            'country' => $additionalData['country'] ?? 'Bangladesh',
+            'status' => 'active',
+            'email_verified_at' => null, // Not verified for guest customers
+        ]);
     }
 
     public function getShoppingPreferencesAttribute()
@@ -520,5 +554,26 @@ class Customer extends Authenticatable
     public function requiresAuthentication(): bool
     {
         return $this->isEcommerceCustomer();
+    }
+
+    /**
+     * Get the identifier that will be stored in the subject claim of the JWT.
+     */
+    public function getJWTIdentifier()
+    {
+        return $this->getKey();
+    }
+
+    /**
+     * Return a key value array, containing any custom claims to be added to the JWT.
+     */
+    public function getJWTCustomClaims()
+    {
+        return [
+            'customer_type' => $this->customer_type,
+            'customer_code' => $this->customer_code,
+            'email' => $this->email,
+            'phone' => $this->phone,
+        ];
     }
 }

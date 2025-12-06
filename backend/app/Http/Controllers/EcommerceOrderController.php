@@ -4,18 +4,22 @@ namespace App\Http\Controllers;
 
 use App\Models\Order;
 use App\Models\OrderItem;
+use App\Models\OrderPayment;
 use App\Models\Cart;
 use App\Models\Product;
 use App\Models\Customer;
 use App\Models\CustomerAddress;
+use App\Traits\DatabaseAgnosticSearch;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
+use Raziul\Sslcommerz\Facades\Sslcommerz;
 use Carbon\Carbon;
 
 class EcommerceOrderController extends Controller
 {
+    use DatabaseAgnosticSearch;
     public function __construct()
     {
         $this->middleware('auth:customer');
@@ -45,10 +49,10 @@ class EcommerceOrderController extends Controller
 
             if ($search) {
                 $query->where(function($q) use ($search) {
-                    $q->where('order_number', 'like', "%{$search}%")
-                      ->orWhereHas('items.product', function($pq) use ($search) {
-                          $pq->where('name', 'like', "%{$search}%");
-                      });
+                    $this->whereLike($q, 'order_number', $search);
+                    $q->orWhereHas('items.product', function($pq) use ($search) {
+                        $this->whereLike($pq, 'name', $search);
+                    });
                 });
             }
 
@@ -117,7 +121,7 @@ class EcommerceOrderController extends Controller
                     'items.product.images',
                     'customer',
                     'store',
-                    'orderPayments'
+                    'payments'
                 ])
                 ->firstOrFail();
 
@@ -158,7 +162,7 @@ class EcommerceOrderController extends Controller
     {
         try {
             $validator = Validator::make($request->all(), [
-                'payment_method' => 'required|string|in:cash_on_delivery,bkash,nagad,credit_card,bank_transfer',
+                'payment_method' => 'required|string|in:cash,card,bank_transfer,digital_wallet,cod,sslcommerz',
                 'shipping_address_id' => 'required|exists:customer_addresses,id',
                 'billing_address_id' => 'nullable|exists:customer_addresses,id',
                 'notes' => 'nullable|string|max:500',
@@ -190,6 +194,16 @@ class EcommerceOrderController extends Controller
                 ], 400);
             }
 
+            // Validate all products still exist and are available
+            foreach ($cartItems as $cartItem) {
+                if (!$cartItem->product) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Some products in your cart are no longer available',
+                    ], 400);
+                }
+            }
+
             // Validate addresses
             $shippingAddress = CustomerAddress::forCustomer($customerId)
                 ->findOrFail($request->shipping_address_id);
@@ -201,78 +215,130 @@ class EcommerceOrderController extends Controller
             DB::beginTransaction();
 
             try {
-                // Calculate totals
+                // Calculate totals using unit_price from cart
                 $subtotal = $cartItems->sum(function($item) {
-                    return $item->price * $item->quantity;
+                    return $item->unit_price * $item->quantity;
                 });
 
                 $deliveryCharge = $this->calculateDeliveryCharge($shippingAddress);
                 $taxAmount = $subtotal * 0.05; // 5% tax
-                $totalAmount = $subtotal + $deliveryCharge + $taxAmount;
-
+                
                 // Apply coupon discount if provided
                 $discountAmount = 0;
                 if ($request->coupon_code) {
                     $discountAmount = $this->applyCoupon($request->coupon_code, $subtotal);
-                    $totalAmount -= $discountAmount;
                 }
+                
+                $totalAmount = $subtotal + $deliveryCharge + $taxAmount - $discountAmount;
 
-                // Create order
+                // Create order - NO STORE ASSIGNED YET
                 $order = Order::create([
-                    'order_number' => $this->generateOrderNumber(),
                     'customer_id' => $customerId,
-                    'store_id' => 1, // Default store
-                    'status' => 'pending',
+                    'store_id' => null, // Will be assigned later by employee
+                    'order_type' => 'ecommerce',
+                    'status' => 'pending_assignment',
+                    'payment_status' => in_array($request->payment_method, ['cod', 'cash']) ? 'pending' : 'unpaid',
+                    'payment_method' => $request->payment_method,
                     'subtotal' => $subtotal,
                     'tax_amount' => $taxAmount,
                     'discount_amount' => $discountAmount,
-                    'shipping_charge' => $deliveryCharge,
+                    'shipping_amount' => $deliveryCharge,
                     'total_amount' => $totalAmount,
-                    'payment_method' => $request->payment_method,
-                    'payment_status' => $request->payment_method === 'cash_on_delivery' ? 'pending' : 'unpaid',
-                    'shipping_address' => json_encode($shippingAddress->formatted_address),
-                    'billing_address' => json_encode($billingAddress->formatted_address),
+                    'shipping_address' => $shippingAddress->toArray(),
+                    'billing_address' => $billingAddress->toArray(),
                     'notes' => $request->notes,
-                    'order_type' => 'online',
-                    'delivery_preference' => $request->delivery_preference ?? 'standard',
-                    'scheduled_delivery_date' => $request->scheduled_delivery_date,
-                    'coupon_code' => $request->coupon_code,
+                    'metadata' => [
+                        'delivery_preference' => $request->delivery_preference ?? 'standard',
+                        'scheduled_delivery_date' => $request->scheduled_delivery_date,
+                        'coupon_code' => $request->coupon_code,
+                    ],
                 ]);
 
-                // Create order items
+                // Create order items without batch/barcode (will be assigned during fulfillment)
                 foreach ($cartItems as $cartItem) {
                     OrderItem::create([
                         'order_id' => $order->id,
                         'product_id' => $cartItem->product_id,
+                        'product_name' => $cartItem->product->name,
+                        'product_sku' => $cartItem->product->sku,
                         'quantity' => $cartItem->quantity,
-                        'price' => $cartItem->price,
-                        'total' => $cartItem->price * $cartItem->quantity,
+                        'unit_price' => $cartItem->unit_price,
+                        'tax_amount' => 0, // Can be calculated per item if needed
+                        'discount_amount' => 0,
+                        'total_amount' => $cartItem->unit_price * $cartItem->quantity,
+                        'notes' => $cartItem->notes,
                     ]);
-
-                    // Update product stock
-                    $cartItem->product->decrement('stock_quantity', $cartItem->quantity);
                 }
 
                 // Clear cart
                 Cart::where('customer_id', $customerId)
                     ->where('status', 'active')
-                    ->update(['status' => 'completed']);
+                    ->delete();
+
+                // Handle payment based on method
+                if ($request->payment_method === 'sslcommerz') {
+                    // Initiate SSLCommerz payment
+                    $transactionId = 'TXN-' . $order->id . '-' . time();
+                    
+                    // Create pending payment record
+                    OrderPayment::create([
+                        'order_id' => $order->id,
+                        'payment_method_id' => null, // SSLCommerz doesn't use payment_methods table
+                        'amount' => $totalAmount,
+                        'transaction_id' => $transactionId,
+                        'status' => 'pending',
+                        'payment_date' => now(),
+                    ]);
+
+                    $customer = Customer::find($customerId);
+                    
+                    $response = Sslcommerz::setOrder($totalAmount, $transactionId, 'Order #' . $order->order_number)
+                        ->setCustomer($customer->name, $customer->email, $customer->phone ?? '01700000000')
+                        ->setShippingInfo($cartItems->sum('quantity'), $shippingAddress->full_address ?? 'N/A')
+                        ->makePayment(['value_a' => $order->id]); // Pass order ID as additional data
+
+                    DB::commit();
+
+                    if ($response->success()) {
+                        return response()->json([
+                            'success' => true,
+                            'message' => 'Order created. Redirecting to payment gateway.',
+                            'data' => [
+                                'order' => $order,
+                                'payment_url' => $response->gatewayPageURL(),
+                                'transaction_id' => $transactionId,
+                            ],
+                        ], 201);
+                    } else {
+                        return response()->json([
+                            'success' => false,
+                            'message' => 'Failed to initiate payment gateway',
+                            'error' => $response->failedReason(),
+                        ], 500);
+                    }
+                }
 
                 DB::commit();
 
-                // Load relationships for response
-                $order->load(['items.product', 'customer']);
+                // Load relationships for response (for COD and other methods)
+                $order->load(['items.product.images', 'customer']);
 
                 return response()->json([
                     'success' => true,
-                    'message' => 'Order created successfully',
+                    'message' => 'Order placed successfully. An employee will assign it to a store shortly.',
                     'data' => [
                         'order' => $order,
                         'order_summary' => [
                             'order_number' => $order->order_number,
+                            'total_items' => $order->items->sum('quantity'),
+                            'subtotal' => $order->subtotal,
+                            'tax' => $order->tax_amount,
+                            'shipping' => $order->shipping_amount,
+                            'discount' => $order->discount_amount,
                             'total_amount' => $order->total_amount,
                             'payment_method' => $order->payment_method,
-                            'estimated_delivery' => $this->getEstimatedDelivery($order),
+                            'status' => 'pending_assignment',
+                            'status_description' => 'Your order is being processed and will be assigned to a store based on inventory availability.',
                         ],
                     ],
                 ], 201);
@@ -448,7 +514,7 @@ class EcommerceOrderController extends Controller
         
         if (str_contains($city, 'dhaka')) {
             return 60.00; // Dhaka delivery
-        } elseif (in_array($city, ['chittagong', 'sylhet', 'rajshahi', 'khulna'])) {
+        } elseif (in_array($city, ['chittagong', 'sylhet', 'rajshahi', 'khulna', 'chattogram'])) {
             return 120.00; // Major cities
         } else {
             return 150.00; // Other areas

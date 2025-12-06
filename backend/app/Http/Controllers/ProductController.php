@@ -7,12 +7,14 @@ use App\Models\Field;
 use App\Models\ProductField;
 use App\Models\Category;
 use App\Models\Vendor;
+use App\Traits\DatabaseAgnosticSearch;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
 
 class ProductController extends Controller
 {
+    use DatabaseAgnosticSearch;
     /**
      * Get all products with filters and custom fields
      */
@@ -39,11 +41,7 @@ class ProductController extends Controller
 
         if ($request->has('search')) {
             $search = $request->search;
-            $query->where(function($q) use ($search) {
-                $q->where('name', 'like', "%{$search}%")
-                  ->orWhere('sku', 'like', "%{$search}%")
-                  ->orWhere('description', 'like', "%{$search}%");
-            });
+            $this->whereAnyLike($query, ['name', 'sku', 'description'], $search);
         }
 
         // Search by custom field value
@@ -55,7 +53,7 @@ class ProductController extends Controller
                 if ($fieldId) {
                     $q->where('field_id', $fieldId);
                 }
-                $q->where('value', 'like', "%{$fieldValue}%");
+                $this->whereLike($q, 'value', $fieldValue);
             });
         }
 
@@ -121,6 +119,7 @@ class ProductController extends Controller
         $validated = $request->validate([
             'category_id' => 'required|exists:categories,id',
             'vendor_id' => 'required|exists:vendors,id',
+            'brand' => 'required|string|max:255',
             'sku' => 'required|string', // SKU not unique - supports variations
             'name' => 'required|string|max:255',
             'description' => 'nullable|string',
@@ -135,6 +134,7 @@ class ProductController extends Controller
             $product = Product::create([
                 'category_id' => $validated['category_id'],
                 'vendor_id' => $validated['vendor_id'],
+                'brand' => $validated['brand'],
                 'sku' => $validated['sku'],
                 'name' => $validated['name'],
                 'description' => $validated['description'] ?? null,
@@ -188,6 +188,7 @@ class ProductController extends Controller
         $validated = $request->validate([
             'category_id' => 'sometimes|exists:categories,id',
             'vendor_id' => 'sometimes|exists:vendors,id',
+            'brand' => 'sometimes|string|max:255',
             'sku' => 'sometimes|string', // SKU not unique - supports variations
             'name' => 'sometimes|string|max:255',
             'description' => 'nullable|string',
@@ -202,6 +203,7 @@ class ProductController extends Controller
             $product->update([
                 'category_id' => $validated['category_id'] ?? $product->category_id,
                 'vendor_id' => $validated['vendor_id'] ?? $product->vendor_id,
+                'brand' => $validated['brand'] ?? $product->brand,
                 'sku' => $validated['sku'] ?? $product->sku,
                 'name' => $validated['name'] ?? $product->name,
                 'description' => $validated['description'] ?? $product->description,
